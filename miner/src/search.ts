@@ -1,38 +1,39 @@
-import { createHash } from 'crypto';
+import { keccak256 } from 'viem';
 import type { SearchResult } from './types.js';
 
-// keccak256 hash function
-export function keccak256(data: Buffer): Buffer {
-  return createHash('keccak256').update(data).digest();
+// Generate random bytes using Node.js crypto
+function randomBytes(len: number): Uint8Array {
+  return new Uint8Array(crypto.getRandomValues(new Uint8Array(len)));
 }
 
-// Concatenate two buffers
-function concatBuffers(...parts: Buffer[]): Buffer {
-  return Buffer.concat(parts);
+function hexToBytes(hex: string): Uint8Array {
+  const cleanHex = hex.replace('0x', '');
+  return new Uint8Array(Buffer.from(cleanHex, 'hex'));
 }
 
-// Pad address to 32 bytes
-function padAddress(addr: `0x${string}`): Buffer {
-  const hex = addr.replace('0x', '');
-  const padded = hex.padStart(64, '0');
-  return Buffer.from(padded, 'hex');
+function bytesToHex(bytes: Uint8Array): string {
+  return '0x' + Buffer.from(bytes).toString('hex');
 }
 
-// Convert bigint to 32-byte buffer (big-endian)
-function bigintTo32Buffer(n: bigint): Buffer {
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const totalLen = parts.reduce((sum, b) => sum + b.length, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const b of parts) {
+    result.set(b, offset);
+    offset += b.length;
+  }
+  return result;
+}
+
+function padAddressTo32(addr: string): Uint8Array {
+  const hex = addr.replace('0x', '').padStart(64, '0');
+  return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
+function bigintTo32Bytes(n: bigint): Uint8Array {
   const hex = n.toString(16).padStart(64, '0');
-  return Buffer.from(hex, 'hex');
-}
-
-// Generate random secret (32 bytes)
-function randomSecret(): Buffer {
-  return Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
-}
-
-// Generate random starting nonce
-function randomNonce(): bigint {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return BigInt('0x' + Buffer.from(bytes).toString('hex'));
+  return new Uint8Array(Buffer.from(hex, 'hex'));
 }
 
 export interface SearchInputs {
@@ -42,39 +43,36 @@ export interface SearchInputs {
   target: bigint;
 }
 
-export function findNonce(inputs: SearchInputs, onProgress?: (hashes: bigint) => void): SearchResult | null {
+export function findNonce(inputs: SearchInputs): SearchResult | null {
   const { epochSeed, anchorHash, minerAddr, target } = inputs;
 
   // challenge = keccak256(anchorHash ‖ epochSeed)
-  const challengeHash = keccak256(
-    concatBuffers(
-      Buffer.from(anchorHash.replace('0x', ''), 'hex'),
-      Buffer.from(epochSeed.replace('0x', ''), 'hex')
-    )
-  );
+  const anchorBytes = hexToBytes(anchorHash);
+  const seedBytes = hexToBytes(epochSeed);
+  const challengeHex = keccak256(concatBytes(anchorBytes, seedBytes));
+  const challengeBytes = hexToBytes(challengeHex);
 
-  const minerAddrBuf = padAddress(minerAddr);
-  let nonce = randomNonce();
+  const minerAddrBuf = padAddressTo32(minerAddr);
+  let nonce = BigInt('0x' + bytesToHex(randomBytes(32)).slice(2));
   let hashes = 0n;
 
-  // Search loop - iterate nonce until keccak256(challenge ‖ minerAddr ‖ nonce) < target
+  // Search loop
   while (true) {
-    const nonceBuf = bigintTo32Buffer(nonce);
-    const hashInput = concatBuffers(challengeHash, minerAddrBuf, nonceBuf);
-    const hashResult = keccak256(hashInput);
+    const nonceBytes = bigintTo32Bytes(nonce);
+    const hashInput = concatBytes(challengeBytes, minerAddrBuf, nonceBytes);
+    const hashHex = keccak256(hashInput);
+    const hashBytes = hexToBytes(hashHex);
 
     hashes++;
 
-    if (onProgress && hashes % 1000000n === 0n) {
-      onProgress(hashes);
-    }
-
-    const hashBigint = BigInt('0x' + hashResult.toString('hex'));
+    // Convert to bigint for comparison
+    const hashBigint = BigInt(hashHex);
 
     if (hashBigint < target) {
       // Found valid nonce!
-      const secret = ('0x' + randomSecret().toString('hex')) as `0x${string}`;
-      return { nonce, secret, challenge: '0x' + challengeHash.toString('hex') };
+      const secretBytes = randomBytes(32);
+      const secret = bytesToHex(secretBytes) as `0x${string}`;
+      return { nonce, secret, challenge: challengeHex };
     }
 
     nonce++;
@@ -89,21 +87,17 @@ export function computeCommitment(
 ): `0x${string}` {
   // commitment = keccak256(abi.encodePacked(nonce, secret, minerAddr, anchorBlock))
   const commitmentHash = keccak256(
-    concatBuffers(
-      bigintTo32Buffer(nonce),
-      Buffer.from(secret.replace('0x', ''), 'hex'),
-      padAddress(minerAddr),
-      bigintTo32Buffer(anchorBlock)
+    concatBytes(
+      bigintTo32Bytes(nonce),
+      hexToBytes(secret),
+      padAddressTo32(minerAddr),
+      bigintTo32Bytes(anchorBlock)
     )
   );
-  return ('0x' + commitmentHash.toString('hex')) as `0x${string}`;
+  return commitmentHash;
 }
 
-// Estimate probability per round
 export function estimateWinProbability(hashesPerRound: bigint, target: bigint): number {
-  // target is compared against uint256 keccak output
-  // Probability = hashesPerRound * target / 2^256
-  // We do hashesPerRound iterations of keccak < target check
   const total = hashesPerRound * target;
   const divisor = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
   return Number(total / divisor) * 100;

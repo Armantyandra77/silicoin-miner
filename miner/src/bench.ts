@@ -1,36 +1,49 @@
-import { createHash } from 'crypto';
+import { keccak256 } from 'viem';
 import { loadConfig } from './config.js';
 
-function keccak256(data: Buffer): Buffer {
-  return createHash('keccak256').update(data).digest();
+function hexToBytes(hex: string): Uint8Array {
+  return new Uint8Array(Buffer.from(hex.replace('0x', ''), 'hex'));
 }
 
-function bigintTo32Buffer(n: bigint): Buffer {
-  const hex = n.toString(16).padStart(64, '0');
-  return Buffer.from(hex, 'hex');
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const totalLen = parts.reduce((sum, b) => sum + b.length, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const b of parts) {
+    result.set(b, offset);
+    offset += b.length;
+  }
+  return result;
 }
 
-function padAddress(addr: string): Buffer {
+function padAddressTo32(addr: string): Uint8Array {
   const hex = addr.replace('0x', '').padStart(64, '0');
-  return Buffer.from(hex, 'hex');
+  return new Uint8Array(Buffer.from(hex, 'hex'));
 }
 
 async function benchJs() {
+  const challenge = new Uint8Array(32);
+  const minerAddr = padAddressTo32('0x742d35Cc6634C0532925a3b844Bc9e7595f1e5b2');
+  const target = BigInt('0x0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+  const nonceBytes = new Uint8Array(32);
+
   const start = Date.now();
   let hashes = 0;
-  const challenge = Buffer.alloc(32);
-  const minerAddr = padAddress('0x742d35Cc6634C0532925a3b844Bc9e7595f1e5b2');
-  const target = BigInt('0x0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
-  const nonce = BigInt(0);
 
   while (Date.now() - start < 2000) {
-    const hashInput = Buffer.concat([challenge, minerAddr, bigintTo32Buffer(nonce)]);
+    const hashInput = concatBytes(challenge, minerAddr, nonceBytes);
     keccak256(hashInput);
     hashes++;
+
+    // Increment nonce bytes
+    for (let i = 31; i >= 0; i--) {
+      nonceBytes[i] = (nonceBytes[i] + 1) & 0xff;
+      if (nonceBytes[i] !== 0) break;
+    }
   }
 
   const elapsed = (Date.now() - start) / 1000;
-  return { hps: hashes / elapsed, name: 'JavaScript (Node.js crypto)' };
+  return { hps: hashes / elapsed, name: 'JavaScript (viem keccak256)' };
 }
 
 console.log('\n=== Silicoin Miner Benchmark ===\n');
