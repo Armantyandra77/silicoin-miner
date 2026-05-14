@@ -14,20 +14,42 @@ import {
 import { findNonce, computeCommitment } from './search.js';
 import { submitCommitRevealMempool } from './tx.js';
 import { sendReport } from './report.js';
-import { GpuMiner, checkGpuAvailable } from './backends/gpu-wrapper.js';
+import { cudaAvailable, cudaSearchOnce } from './cuda.js';
 import { ANCHOR_SAFE_DISTANCE, RPC_FALLBACKS } from './constants.js';
 import type { MiningStats } from './types.js';
-import { formatEther } from 'viem';
+import { formatEther, keccak256 } from 'viem';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 const ALL_RPCS = (rpc: string) => [rpc, ...RPC_FALLBACKS.filter(u => u !== rpc)];
-
 let currentRpcIndex = 0;
 
 function getNextRpc(primaryRpc: string): string {
   const rpcs = ALL_RPCS(primaryRpc);
   return rpcs[currentRpcIndex++ % rpcs.length];
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const cleanHex = hex.replace('0x', '');
+  return new Uint8Array(Buffer.from(cleanHex, 'hex'));
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const totalLen = parts.reduce((sum, b) => sum + b.length, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const b of parts) { result.set(b, offset); offset += b.length; }
+  return result;
+}
+
+function padAddressTo32(addr: string): Uint8Array {
+  const hex = addr.replace('0x', '').padStart(64, '0');
+  return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
+function bigintTo32Bytes(n: bigint): Uint8Array {
+  const hex = n.toString(16).padStart(64, '0');
+  return new Uint8Array(Buffer.from(hex, 'hex'));
 }
 
 async function getSlcPriceUsd(): Promise<number> {
@@ -77,19 +99,18 @@ async function miningLoop() {
   const minerAddr = getAddress(account);
 
   console.log(`Miner address: ${minerAddr}`);
-  console.log(`Checking GPU availability...`);
+  console.log(`Checking CUDA availability...`);
 
-  const gpuAvailable = await checkGpuAvailable();
-  const useGpu = gpuAvailable && (config.minerBackend === 'gpu' || config.minerBackend === 'auto');
+  const hasCuda = cudaAvailable();
+  const useCuda = hasCuda && (config.minerBackend === 'gpu' || config.minerBackend === 'auto');
 
-  const gpuMiner = useGpu ? new GpuMiner() : null;
-
-  if (useGpu) {
-    console.log(`✓ GPU miner available (PyTorch + CUDA)\n`);
+  if (useCuda) {
+    console.log(`✓ CUDA GPU miner available (bin/slc-cuda)\n`);
   } else {
-    console.log(`✗ GPU not available, using JavaScript fallback\n`);
-    console.log(`  To use GPU: pip install torch --index-url https://download.pytorch.org/whl/cu121`);
-    console.log(`             pip install pycryptodome\n`);
+    console.log(`✗ CUDA not available, using JavaScript fallback\n`);
+    if (config.minerBackend === 'gpu') {
+      console.log(`  Build CUDA miner: bash native/build_cuda.sh`);
+    }
   }
 
   let stats: MiningStats = {
@@ -164,30 +185,42 @@ async function miningLoop() {
         continue;
       }
 
+      // Compute challenge = keccak256(anchorHash ‖ epochSeed)
+      const challengeHex = keccak256(concatBytes(hexToBytes(anchorHash), hexToBytes(params.epochSeed)));
       searchStartTime = Date.now();
       console.log(`\n[Epoch ${currentEpoch}] Anchor block ${anchorBlock} | Target: ${params.target.toString(16).slice(0, 12)}...`);
 
       let result: { nonce: bigint; secret: `0x${string}` } | null = null;
 
-      if (useGpu && gpuMiner) {
-        // GPU search
+      if (useCuda) {
+        // Native CUDA search
         try {
-          result = await gpuMiner.search(
-            params.epochSeed,
-            minerAddr,
-            params.target
-          );
-        } catch (err: any) {
-          console.log(`  GPU search failed: ${err.message.slice(0, 100)} - falling back to JS`);
-          result = findNonce({
-            epochSeed: params.epochSeed,
-            anchorHash: anchorHash,
-            minerAddr: minerAddr,
+          console.log(`    [CUDA] Starting GPU search...`);
+          console.log(`    [CUDA] Challenge: ${challengeHex.slice(0, 20)}...`);
+          console.log(`    [CUDA] Target: 0x${params.target.toString(16).slice(0, 20)}...`);
+
+          const cudaResult = await cudaSearchOnce({
+            ch: challengeHex,
             target: params.target,
+            miner: minerAddr,
           });
+
+          if (cudaResult.found) {
+            const secretBytes = new Uint8Array(32);
+            crypto.getRandomValues(secretBytes);
+            const secret = '0x' + Buffer.from(secretBytes).toString('hex') as `0x${string}`;
+            result = { nonce: BigInt(cudaResult.nonce!), secret };
+            console.log(`    [CUDA] Found! Nonce: ${cudaResult.nonce}, ${cudaResult.hps?.toLocaleString()} H/s`);
+          } else {
+            console.log(`    [CUDA] No solution in batch. Retrying...`);
+          }
+        } catch (err: any) {
+          console.log(`    [CUDA] Error: ${err.message?.slice(0, 100)} - falling back to JS`);
         }
-      } else {
-        // JS fallback
+      }
+
+      // JS fallback or if CUDA didn't find
+      if (!result) {
         result = findNonce({
           epochSeed: params.epochSeed,
           anchorHash: anchorHash,
@@ -265,8 +298,6 @@ async function miningLoop() {
       await sleep(5000);
     }
   }
-
-  gpuMiner?.kill();
 
   console.log('\n=== Mining Complete ===');
   console.log(`Wins: ${stats.wins}`);

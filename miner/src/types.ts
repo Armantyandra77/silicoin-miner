@@ -65,4 +65,9 @@ export interface EnvConfig {
   bundleMode: 'flashbots' | 'mempool';
   workers: number;
   flashbotsRpc?: string;
+  // CUDA GPU config
+  cudaBatch: number;
+  cudaThreads: number;
+  cudaBlocks: number;
+  cudaBlocksMult: number;
 }

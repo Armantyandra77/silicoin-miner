@@ -40,6 +40,11 @@ export function loadConfig(): EnvConfig {
     bundleMode: (getEnv('BUNDLE', 'flashbots') as 'flashbots' | 'mempool'),
     workers: parseInt(getEnv('WORKERS', String(DEFAULT_WORKERS)), 10),
     flashbotsRpc: getEnv('FLASHBOTS_RPC') || undefined,
+    // CUDA config
+    cudaBatch: Math.max(1024, parseInt(getEnv('CUDA_BATCH', '4194304'), 10)),
+    cudaThreads: Math.max(0, parseInt(getEnv('CUDA_THREADS', '0'), 10)),
+    cudaBlocks: Math.max(0, parseInt(getEnv('CUDA_BLOCKS', '0'), 10)),
+    cudaBlocksMult: Math.max(0, parseInt(getEnv('CUDA_BLOCKS_MULT', '0'), 10)),
   };
 }
 
@@ -67,6 +72,7 @@ Mining Config:
   Max Gas:    ${config.maxGasGwei} gwei
   Budget:     ${config.budgetEth} ETH
   Backend:    ${config.minerBackend}
+  CUDA Batch: ${config.cudaBatch.toLocaleString()}
   Workers:    ${config.workers || 'auto'}
   Bundle:     ${config.bundleMode}
   Reporting:  ${config.reportEnabled ? 'ON' : 'OFF'}

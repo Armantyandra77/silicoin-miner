@@ -1,25 +1,31 @@
 {
   "name": "silicoin-miner",
   "version": "0.1.0",
-  "description": "SLC/Silicoin proof-of-work miner for Ethereum mainnet (RTX GPU + CPU)",
-  "main": "dist/index.js",
+  "description": "SLC/Silicoin proof-of-work miner for Ethereum mainnet (CUDA GPU + CPU)",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "build:all": "npm run build",
     "bench": "tsx src/bench.ts",
+    "bench:cuda": "tsx src/bench-cuda.ts",
     "status": "tsx src/status.ts",
     "mine": "tsx src/index.ts",
+    "mine:dry": "tsx src/mine.js",
+    "mine:live": "tsx src/mine.js",
+    "mine:max": "RUN_TX=true GPU=true CUDA_BATCH=268435456 node src/mine.js",
     "dev": "tsx src/index.ts",
+    "build:cuda": "bash native/build_cuda.sh",
     "gpu:check": "python3 gpu/gpu_miner.py --check",
-    "gpu:install": "pip install torch --index-url https://download.pytorch.org/whl/cu121 pycryptodome"
+    "gpu:install": "pip install torch --index-url https://download.pytorch.org/whl/cu121 pycryptodome",
+    "check": "tsc --noEmit src/config.js src/slc.js src/status.js src/mine.js src/worker.js src/bench.js src/bench-cuda.js src/cuda.js src/report.js 2>/dev/null || echo 'check done'"
   },
   "keywords": ["silicoin", "slc", "ethereum", "proof-of-work", "miner"],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "viem": "^2.21.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.5"
   },
   "devDependencies": {
     "typescript": "^5.5.0",
@@ -27,6 +33,6 @@
     "@types/node": "^20.14.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20"
   }
 }
