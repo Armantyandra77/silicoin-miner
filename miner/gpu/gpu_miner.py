@@ -65,14 +65,14 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
     start_time = time.time()
     last_report = start_time
     
-    # Nonce buffer on CPU, upload each batch
-    nonce_base = torch.arange(BATCH, dtype=torch.uint32)
+    # Nonce buffer on CPU (use int64 - arange uint32 not supported on CPU)
+    nonce_base = torch.arange(BATCH, dtype=torch.int64)
     
     from Crypto.Hash import keccak
     
     while True:
-        # Generate nonce batch
-        nonce_batch = nonce_base + nonce
+        # Generate nonce batch on CPU as int64, move to CUDA
+        nonce_batch = (nonce_base + nonce).to('cuda')
         
         if HAS_KERNEL:
             # Use compiled CUDA kernel
