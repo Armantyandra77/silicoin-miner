@@ -10,7 +10,9 @@
     "bench": "tsx src/bench.ts",
     "status": "tsx src/status.ts",
     "mine": "tsx src/index.ts",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "gpu:check": "python3 gpu/gpu_miner.py --check",
+    "gpu:install": "pip install torch --index-url https://download.pytorch.org/whl/cu121 pycryptodome"
   },
   "keywords": ["silicoin", "slc", "ethereum", "proof-of-work", "miner"],
   "author": "",

@@ -11,9 +11,10 @@ import {
   getBalance,
   getSlcBalance,
 } from './chain.js';
-import { findNonce, computeCommitment, estimateWinProbability } from './search.js';
+import { findNonce, computeCommitment } from './search.js';
 import { submitCommitRevealMempool } from './tx.js';
 import { sendReport } from './report.js';
+import { GpuMiner, checkGpuAvailable } from './backends/gpu-wrapper.js';
 import { ANCHOR_SAFE_DISTANCE, RPC_FALLBACKS } from './constants.js';
 import type { MiningStats } from './types.js';
 import { formatEther } from 'viem';
@@ -26,9 +27,7 @@ let currentRpcIndex = 0;
 
 function getNextRpc(primaryRpc: string): string {
   const rpcs = ALL_RPCS(primaryRpc);
-  const rpc = rpcs[currentRpcIndex % rpcs.length];
-  currentRpcIndex++;
-  return rpc;
+  return rpcs[currentRpcIndex++ % rpcs.length];
 }
 
 async function getSlcPriceUsd(): Promise<number> {
@@ -43,23 +42,56 @@ async function getSlcPriceUsd(): Promise<number> {
   return 0;
 }
 
+async function withRpcRetry<T>(
+  config: { rpcUrl: string },
+  publicClient: ReturnType<typeof createPublicClient>,
+  fn: () => Promise<T>
+): Promise<T> {
+  const rpcs = ALL_RPCS(config.rpcUrl);
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < rpcs.length; attempt++) {
+    try {
+      publicClient = createClients(rpcs[attempt % rpcs.length]).publicClient;
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      if (attempt < rpcs.length - 1) {
+        console.log(`  RPC ${rpcs[attempt % rpcs.length].slice(0, 40)}... failed, trying fallback`);
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function miningLoop() {
   console.log('\n=== Silicoin Miner Starting ===\n');
 
-  // Load and validate config
   const config = loadConfig();
   checkConfig(config);
   console.log(configSummary(config));
   console.log('');
 
-  // Setup clients with primary RPC
   let { publicClient } = createClients(config.rpcUrl);
   const { account, walletClient } = createWallet(config);
   const minerAddr = getAddress(account);
 
-  console.log(`Miner address: ${minerAddr}\n`);
+  console.log(`Miner address: ${minerAddr}`);
+  console.log(`Checking GPU availability...`);
 
-  // Initial state
+  const gpuAvailable = await checkGpuAvailable();
+  const useGpu = gpuAvailable && (config.minerBackend === 'gpu' || config.minerBackend === 'auto');
+
+  const gpuMiner = useGpu ? new GpuMiner() : null;
+
+  if (useGpu) {
+    console.log(`✓ GPU miner available (PyTorch + CUDA)\n`);
+  } else {
+    console.log(`✗ GPU not available, using JavaScript fallback\n`);
+    console.log(`  To use GPU: pip install torch --index-url https://download.pytorch.org/whl/cu121`);
+    console.log(`             pip install pycryptodome\n`);
+  }
+
   let stats: MiningStats = {
     wins: 0,
     slcMined: 0n,
@@ -76,53 +108,32 @@ async function miningLoop() {
   let lastWinTx: `0x${string}` | undefined;
   let lastWinBlock: number | undefined;
   let lastWinAt: number | undefined;
-  let rpcFailureCount = 0;
-
-  // Helper to rotate RPC on failure
-  async function withRpcRetry<T>(fn: () => Promise<T>): Promise<T> {
-    const rpcs = ALL_RPCS(config.rpcUrl);
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < rpcs.length; attempt++) {
-      try {
-        // Recreate client with current RPC
-        publicClient = createClients(rpcs[attempt % rpcs.length]).publicClient;
-        return await fn();
-      } catch (err: any) {
-        lastError = err;
-        if (attempt < rpcs.length - 1) {
-          console.log(`  RPC failed, trying next... (${err.message?.slice(0, 60)})`);
-        }
-      }
-    }
-    throw lastError;
-  }
+  let searchStartTime = 0;
+  let currentEpoch = 0;
 
   console.log('Checking if pool is live...\n');
 
   let poolLive = false;
   try {
-    const initialParams = await withRpcRetry(() => getMineParams(publicClient));
+    const initialParams = await withRpcRetry(config, publicClient, () => getMineParams(publicClient));
     poolLive = initialParams.poolLive;
+    currentEpoch = initialParams.epoch;
     if (!poolLive) {
-      console.log('ERROR: Pool is not live yet. Wait for deployer to open trading.');
+      console.log('ERROR: Pool is not live yet.');
       return;
     }
-    console.log(`Pool is LIVE. Reward: ${initialParams.reward.toLocaleString()} SLC\n`);
+    console.log(`Pool is LIVE. Reward: ${initialParams.reward.toLocaleString()} SLC (${(Number(initialParams.reward) / 1e18).toFixed(0)} SLC)\n`);
   } catch (err) {
-    console.log(`ERROR: Cannot connect to RPC. All endpoints failed.`);
-    console.log(`Try: RPC_URL=https://rpc.ankr.com/eth in .env`);
+    console.log(`ERROR: Cannot connect to RPC. Check your RPC_URL in .env`);
     return;
   }
 
   // Main mining loop
   while (true) {
     try {
-      // Check gas price
-      const gasPrice = await withRpcRetry(() => getGasPrice(publicClient));
+      const gasPrice = await withRpcRetry(config, publicClient, () => getGasPrice(publicClient));
       const gasPriceGwei = Number(gasPrice) / 1e9;
 
-      // Check budget
       if (totalGasSpent >= config.budgetEth) {
         console.log('\n=== BUDGET EXHAUSTED ===');
         console.log(`Gas spent: ${formatEther(totalGasSpent)} ETH`);
@@ -131,51 +142,73 @@ async function miningLoop() {
         break;
       }
 
-      // Pause if gas too high
       if (gasPriceGwei > config.maxGasGwei) {
         console.log(`[${new Date().toISOString()}] Gas too high (${gasPriceGwei.toFixed(1)} gwei > ${config.maxGasGwei}). Waiting...`);
         await sleep(30000);
         continue;
       }
 
-      // Get latest mine params
-      const params = await withRpcRetry(() => getMineParams(publicClient));
-      const currentEpoch = params.epoch;
+      // Get mine params
+      const params = await withRpcRetry(config, publicClient, () => getMineParams(publicClient));
+      currentEpoch = params.epoch;
 
-      // Get anchor block (latest - 2 for safety)
-      const latestBlock = await withRpcRetry(() => getLatestBlock(publicClient));
+      // Get anchor block
+      const latestBlock = await withRpcRetry(config, publicClient, () => getLatestBlock(publicClient));
       const anchorBlock = latestBlock - ANCHOR_SAFE_DISTANCE;
-      const anchorHash = await withRpcRetry(() => getBlockHash(publicClient, anchorBlock));
+      const anchorHash = await withRpcRetry(config, publicClient, () => getBlockHash(publicClient, anchorBlock));
 
-      // Re-read params after getting anchor (race condition protection)
-      const paramsAfterAnchor = await withRpcRetry(() => getMineParams(publicClient));
-      if (paramsAfterAnchor.epoch !== currentEpoch || paramsAfterAnchor.target !== params.target) {
-        console.log('Params changed during anchor selection - retrying...');
+      // Verify params didn't change
+      const paramsCheck = await withRpcRetry(config, publicClient, () => getMineParams(publicClient));
+      if (paramsCheck.epoch !== currentEpoch || paramsCheck.target !== params.target) {
+        console.log('Params changed during anchor - retrying...');
         continue;
       }
 
-      // Search for valid nonce
-      console.log(`[Epoch ${currentEpoch}] Searching from anchor block ${anchorBlock}...`);
-      const searchStart = Date.now();
+      searchStartTime = Date.now();
+      console.log(`\n[Epoch ${currentEpoch}] Anchor block ${anchorBlock} | Target: ${params.target.toString(16).slice(0, 12)}...`);
 
-      const result = findNonce({
-        epochSeed: params.epochSeed,
-        anchorHash: anchorHash,
-        minerAddr: minerAddr,
-        target: params.target,
-      });
+      let result: { nonce: bigint; secret: `0x${string}` } | null = null;
 
-      const searchTime = (Date.now() - searchStart) / 1000;
-      lastHashrate = Math.round(Number(stats.hashesChecked) / searchTime);
+      if (useGpu && gpuMiner) {
+        // GPU search
+        try {
+          result = await gpuMiner.search(
+            params.epochSeed,
+            minerAddr,
+            params.target
+          );
+        } catch (err: any) {
+          console.log(`  GPU search failed: ${err.message.slice(0, 100)} - falling back to JS`);
+          result = findNonce({
+            epochSeed: params.epochSeed,
+            anchorHash: anchorHash,
+            minerAddr: minerAddr,
+            target: params.target,
+          });
+        }
+      } else {
+        // JS fallback
+        result = findNonce({
+          epochSeed: params.epochSeed,
+          anchorHash: anchorHash,
+          minerAddr: minerAddr,
+          target: params.target,
+        });
+      }
 
-      console.log(`  Found nonce in ${searchTime.toFixed(2)}s`);
-      console.log(`  Nonce: ${result.nonce.toString()}`);
+      const searchTime = (Date.now() - searchStartTime) / 1000;
+
+      if (!result) {
+        console.log('  No result - retrying');
+        continue;
+      }
+
+      console.log(`  Found nonce in ${searchTime.toFixed(2)}s | Nonce: ${result.nonce.toString()}`);
 
       // Compute commitment
       const commitment = computeCommitment(result.nonce, result.secret, minerAddr, BigInt(anchorBlock));
-      console.log(`  Commitment: ${commitment}`);
 
-      // Submit commit+reveal
+      // Submit
       const targetBlock = latestBlock + 1;
       console.log(`  Commit → block ${targetBlock}, Reveal → block ${targetBlock + 1}`);
 
@@ -195,16 +228,16 @@ async function miningLoop() {
         lastWinBlock = targetBlock + 1;
         lastWinAt = Date.now();
 
-        console.log(`  ✓ Win #${stats.wins}! Commit: ${submitResult.commitTx}`);
-        console.log(`  TX: https://etherscan.io/tx/${submitResult.commitTx}`);
+        console.log(`\n  ✓ Win #${stats.wins}! Commit TX: ${submitResult.commitTx}`);
+        console.log(`  https://etherscan.io/tx/${submitResult.commitTx}\n`);
       } else {
-        console.log(`  ✗ Submit failed: ${submitResult.error || 'unknown'}`);
+        console.log(`  ✗ Submit failed: ${submitResult.error || 'unknown'}\n`);
       }
 
       // Update balances
       const [ethBal, slcBal] = await Promise.all([
-        withRpcRetry(() => getBalance(publicClient, minerAddr)),
-        withRpcRetry(() => getSlcBalance(publicClient, minerAddr)),
+        withRpcRetry(config, publicClient, () => getBalance(publicClient, minerAddr)),
+        withRpcRetry(config, publicClient, () => getSlcBalance(publicClient, minerAddr)),
       ]);
       stats.walletEth = ethBal;
       stats.walletSlc = slcBal;
@@ -225,21 +258,20 @@ async function miningLoop() {
         lastReportTime = Date.now();
       }
 
-      // Small delay between rounds
       await sleep(1000);
 
     } catch (err: any) {
-      console.error(`\nError: ${err.message?.slice(0, 100)}`);
+      console.error(`\nError: ${err.message?.slice(0, 150)}`);
       await sleep(5000);
     }
   }
 
-  // Final summary
+  gpuMiner?.kill();
+
   console.log('\n=== Mining Complete ===');
   console.log(`Wins: ${stats.wins}`);
   console.log(`SLC: ${stats.slcMined.toLocaleString()}`);
   console.log(`Gas spent: ${formatEther(totalGasSpent)} ETH`);
 }
 
-// Entry point
 miningLoop().catch(console.error);
