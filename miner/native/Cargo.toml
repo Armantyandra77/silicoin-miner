@@ -1,0 +1,17 @@
+[package]
+name = "silicoin-gpu-miner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ethnum = "0.2"
+log = "0.4"
+env_logger = "0.10"
+
+[dependencies.opencl3]
+version = "0.9"
+features = ["CL_VERSION_3_0"]
+
+[profile.release]
+opt-level = 3
+lto = true
