@@ -60,19 +60,19 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
         log({"status": "running", "mode": "cuda_tensor", "gpu": gpu_name})
     
     BATCH = 1 << 20  # 1M nonces per batch
-    nonce = int.from_bytes(os.urandom(8), 'big')
+    nonce_counter = int.from_bytes(os.urandom(8), 'big') % (2**31)  # Keep within int32
     total_hashes = 0
     start_time = time.time()
     last_report = start_time
     
-    # Nonce buffer on CPU (use int64 - arange uint32 not supported on CPU)
+    # Nonce buffer on CPU
     nonce_base = torch.arange(BATCH, dtype=torch.int64)
     
     from Crypto.Hash import keccak
     
     while True:
-        # Generate nonce batch on CPU as int64, move to CUDA
-        nonce_batch = (nonce_base + nonce).to('cuda')
+        # Generate sequential nonce batch on CPU (small int32 numbers)
+        nonce_batch = (nonce_base + nonce_counter).to(torch.int32).to('cuda')
         
         if HAS_KERNEL:
             # Use compiled CUDA kernel (nonce must be uint32 on CUDA)
@@ -88,7 +88,7 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
                     elapsed_ms = int((time.time() - start_time) * 1000)
                     log({
                         "status": "found",
-                        "nonce": str(nonce + i),
+                        "nonce": str(nonce_counter + i),
                         "secret": "***" + secret.hex(),
                         "hashes": total_hashes + i,
                         "time_ms": elapsed_ms
@@ -100,7 +100,7 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
             found = False
             
             for i in range(BATCH):
-                nonce_bytes = (nonce + i).to_bytes(32, 'big')
+                nonce_bytes = (nonce_counter + i).to_bytes(32, 'big')
                 k = keccak.new(digest_bits=256)
                 k.update(base + nonce_bytes)
                 h_int = int.from_bytes(k.digest(), 'big')
@@ -111,15 +111,16 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
                     elapsed_ms = int((time.time() - start_time) * 1000)
                     log({
                         "status": "found",
-                        "nonce": str(nonce + i),
+                        "nonce": str(nonce_counter + i),
                         "secret": "***" + secret.hex(),
                         "hashes": total_hashes,
                         "time_ms": elapsed_ms
                     })
                     return
         
-        total_hashes += BATCH
-        nonce += BATCH
+        nonce_counter += BATCH
+        if nonce_counter > 0x7FFFFFFF:
+            nonce_counter = int.from_bytes(os.urandom(4), 'big')
         
         now = time.time()
         if now - last_report >= 0.5:
@@ -128,7 +129,7 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
                 "status": "running",
                 "hashes": total_hashes,
                 "hps": int(hps),
-                "nonce": str(nonce)
+                "nonce": str(nonce_counter)
             })
             last_report = now
 
