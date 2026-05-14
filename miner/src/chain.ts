@@ -1,14 +1,49 @@
-import { createPublicClient, createWalletClient, http, custom, encodeFunctionData, hexToBigInt, toHex } from 'viem';
+import { createPublicClient, http } from 'viem';
 import { mainnet } from 'viem/chains';
-import { SLC_ADDRESS, CONTRACT_ABI } from './constants.js';
+import { SLC_ADDRESS, CONTRACT_ABI, RPC_FALLBACKS } from './constants.js';
 import type { MineParams } from './types.js';
 
 export function createClients(rpcUrl: string) {
   const publicClient = createPublicClient({
     chain: mainnet,
-    transport: http(rpcUrl),
+    transport: http(rpcUrl, {
+      retryCount: 3,
+      retryDelay: 1000,
+    }),
   });
   return { publicClient };
+}
+
+export function createClientsWithFallback(primaryRpc: string) {
+  // Try primary first, then fallbacks on failure
+  const urls = [primaryRpc, ...RPC_FALLBACKS].filter(u => u !== primaryRpc);
+
+  const publicClient = createPublicClient({
+    chain: mainnet,
+    transport: http(primaryRpc, {
+      retryCount: 2,
+      retryDelay: 500,
+    }),
+  });
+
+  return { publicClient, fallbackRpcs: urls };
+}
+
+async function withRpcFallback<T>(
+  rpcs: string[],
+  fn: (rpc: string) => Promise<T>,
+  fallbackIndex = 0
+): Promise<T> {
+  if (fallbackIndex >= rpcs.length) {
+    throw new Error(`All RPCs failed: ${rpcs.join(', ')}`);
+  }
+
+  try {
+    return await fn(rpcs[fallbackIndex]);
+  } catch (err: any) {
+    console.log(`RPC ${rpcs[fallbackIndex]} failed: ${err.message.slice(0, 80)}... trying fallback`);
+    return withRpcFallback(rpcs, fn, fallbackIndex + 1);
+  }
 }
 
 export async function getMineParams(publicClient: ReturnType<typeof createPublicClient>): Promise<MineParams> {

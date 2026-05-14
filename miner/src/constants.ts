@@ -51,7 +51,13 @@ export const CONTRACT_ABI = [
 ] as const;
 
 // RPC Endpoints
-export const DEFAULT_RPC = 'https://eth.llamarpc.com';
+export const DEFAULT_RPC = 'https://rpc.ankr.com/eth';
+export const RPC_FALLBACKS = [
+  'https://rpc.ankr.com/eth',
+  'https://eth.drpc.org',
+  'https://ethereum-rpc.publicnode.com',
+  'https://cloudflare-eth.com',
+];
 
 // Telemetry endpoint
 export const TELEMETRY_URL = 'https://svwobzsafxhhndcojmia.supabase.co/functions/v1/report';

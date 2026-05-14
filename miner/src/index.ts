@@ -12,13 +12,24 @@ import {
   getSlcBalance,
 } from './chain.js';
 import { findNonce, computeCommitment, estimateWinProbability } from './search.js';
-import { submitCommitRevealMempool, verifyCommitInclusion } from './tx.js';
+import { submitCommitRevealMempool } from './tx.js';
 import { sendReport } from './report.js';
-import { ANCHOR_SAFE_DISTANCE, SLC_DECIMALS } from './constants.js';
+import { ANCHOR_SAFE_DISTANCE, RPC_FALLBACKS } from './constants.js';
 import type { MiningStats } from './types.js';
 import { formatEther } from 'viem';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+const ALL_RPCS = (rpc: string) => [rpc, ...RPC_FALLBACKS.filter(u => u !== rpc)];
+
+let currentRpcIndex = 0;
+
+function getNextRpc(primaryRpc: string): string {
+  const rpcs = ALL_RPCS(primaryRpc);
+  const rpc = rpcs[currentRpcIndex % rpcs.length];
+  currentRpcIndex++;
+  return rpc;
+}
 
 async function getSlcPriceUsd(): Promise<number> {
   try {
@@ -41,8 +52,8 @@ async function miningLoop() {
   console.log(configSummary(config));
   console.log('');
 
-  // Setup clients
-  const { publicClient } = createClients(config.rpcUrl);
+  // Setup clients with primary RPC
+  let { publicClient } = createClients(config.rpcUrl);
   const { account, walletClient } = createWallet(config);
   const minerAddr = getAddress(account);
 
@@ -65,20 +76,50 @@ async function miningLoop() {
   let lastWinTx: `0x${string}` | undefined;
   let lastWinBlock: number | undefined;
   let lastWinAt: number | undefined;
+  let rpcFailureCount = 0;
+
+  // Helper to rotate RPC on failure
+  async function withRpcRetry<T>(fn: () => Promise<T>): Promise<T> {
+    const rpcs = ALL_RPCS(config.rpcUrl);
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < rpcs.length; attempt++) {
+      try {
+        // Recreate client with current RPC
+        publicClient = createClients(rpcs[attempt % rpcs.length]).publicClient;
+        return await fn();
+      } catch (err: any) {
+        lastError = err;
+        if (attempt < rpcs.length - 1) {
+          console.log(`  RPC failed, trying next... (${err.message?.slice(0, 60)})`);
+        }
+      }
+    }
+    throw lastError;
+  }
 
   console.log('Checking if pool is live...\n');
-  const initialParams = await getMineParams(publicClient);
-  if (!initialParams.poolLive) {
-    console.log('ERROR: Pool is not live yet. Wait for deployer to open trading.');
+
+  let poolLive = false;
+  try {
+    const initialParams = await withRpcRetry(() => getMineParams(publicClient));
+    poolLive = initialParams.poolLive;
+    if (!poolLive) {
+      console.log('ERROR: Pool is not live yet. Wait for deployer to open trading.');
+      return;
+    }
+    console.log(`Pool is LIVE. Reward: ${initialParams.reward.toLocaleString()} SLC\n`);
+  } catch (err) {
+    console.log(`ERROR: Cannot connect to RPC. All endpoints failed.`);
+    console.log(`Try: RPC_URL=https://rpc.ankr.com/eth in .env`);
     return;
   }
-  console.log(`Pool is LIVE. Reward: ${initialParams.reward.toLocaleString()} SLC\n`);
 
   // Main mining loop
   while (true) {
     try {
       // Check gas price
-      const gasPrice = await getGasPrice(publicClient);
+      const gasPrice = await withRpcRetry(() => getGasPrice(publicClient));
       const gasPriceGwei = Number(gasPrice) / 1e9;
 
       // Check budget
@@ -98,16 +139,16 @@ async function miningLoop() {
       }
 
       // Get latest mine params
-      const params = await getMineParams(publicClient);
+      const params = await withRpcRetry(() => getMineParams(publicClient));
       const currentEpoch = params.epoch;
 
       // Get anchor block (latest - 2 for safety)
-      const latestBlock = await getLatestBlock(publicClient);
+      const latestBlock = await withRpcRetry(() => getLatestBlock(publicClient));
       const anchorBlock = latestBlock - ANCHOR_SAFE_DISTANCE;
-      const anchorHash = await getBlockHash(publicClient, anchorBlock);
+      const anchorHash = await withRpcRetry(() => getBlockHash(publicClient, anchorBlock));
 
       // Re-read params after getting anchor (race condition protection)
-      const paramsAfterAnchor = await getMineParams(publicClient);
+      const paramsAfterAnchor = await withRpcRetry(() => getMineParams(publicClient));
       if (paramsAfterAnchor.epoch !== currentEpoch || paramsAfterAnchor.target !== params.target) {
         console.log('Params changed during anchor selection - retrying...');
         continue;
@@ -122,16 +163,7 @@ async function miningLoop() {
         anchorHash: anchorHash,
         minerAddr: minerAddr,
         target: params.target,
-      }, (hashes) => {
-        process.stdout.write(`\r  Hashes: ${hashes.toLocaleString()}`);
       });
-
-      console.log('');
-
-      if (!result) {
-        console.log('Search returned null - retrying');
-        continue;
-      }
 
       const searchTime = (Date.now() - searchStart) / 1000;
       lastHashrate = Math.round(Number(stats.hashesChecked) / searchTime);
@@ -171,8 +203,8 @@ async function miningLoop() {
 
       // Update balances
       const [ethBal, slcBal] = await Promise.all([
-        getBalance(publicClient, minerAddr),
-        getSlcBalance(publicClient, minerAddr),
+        withRpcRetry(() => getBalance(publicClient, minerAddr)),
+        withRpcRetry(() => getSlcBalance(publicClient, minerAddr)),
       ]);
       stats.walletEth = ethBal;
       stats.walletSlc = slcBal;
@@ -197,7 +229,7 @@ async function miningLoop() {
       await sleep(1000);
 
     } catch (err: any) {
-      console.error(`\nError in mining loop: ${err.message}`);
+      console.error(`\nError: ${err.message?.slice(0, 100)}`);
       await sleep(5000);
     }
   }
