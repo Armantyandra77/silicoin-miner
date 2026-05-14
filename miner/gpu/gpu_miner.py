@@ -76,10 +76,12 @@ def mine_cuda(challenge_hex: str, miner_addr_hex: str, target_hex: str):
         
         if HAS_KERNEL:
             # Use compiled CUDA kernel (nonce must be uint32 on CUDA)
-            # Target is uint256 but kernel takes uint64 — send high 64 bits for comparison
+            # Target is uint256 — use high 64 bits as threshold
             nonce_t = nonce_batch.to(torch.int32).to('cuda')
             target_hi = int(target >> 192)  # top 64 bits of uint256
-            results = keccak256_cuda.keccak256(chal_t, addr_t, nonce_t, target_hi)
+            # Pass as torch scalar so .item() doesn't convert to float
+            target_t = torch.tensor(target_hi, dtype=torch.uint64, device='cpu')
+            results = keccak256_cuda.keccak256(chal_t, addr_t, nonce_t, target_t.item())
             
             # Check results on CPU
             results_cpu = results.cpu()
