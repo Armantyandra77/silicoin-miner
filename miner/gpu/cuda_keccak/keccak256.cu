@@ -240,7 +240,7 @@ __global__ void keccak256_batch_kernel(
 torch::Tensor keccak256_cuda(
     torch::Tensor challenge,   // (33,) uint8 CUDA
     torch::Tensor miner_addr,  // (20,) uint8 CUDA
-    torch::Tensor nonces,      // (N,) uint32 CUDA
+    torch::Tensor nonces,      // (N,) int32 CUDA
     uint64_t target
 ) {
     int batch_size = nonces.size(0);
