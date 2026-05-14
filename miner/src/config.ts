@@ -19,12 +19,21 @@ function getRequired(key: string): `0x${string}` {
   return val as `0x${string}`;
 }
 
+function parseEthToWei(ethStr: string): bigint {
+  // Convert ETH string like "0.02" to wei bigint
+  const [whole, fraction] = ethStr.split('.');
+  const paddedFraction = (fraction || '0').padEnd(18, '0').slice(0, 18);
+  const weiStr = whole + paddedFraction;
+  return BigInt(weiStr);
+}
+
 export function loadConfig(): EnvConfig {
+  const budgetStr = getEnv('BUDGET_ETH', DEFAULT_BUDGET_ETH);
   return {
     privateKey: getRequired('PRIVATE_KEY'),
     rpcUrl: getEnv('RPC_URL', DEFAULT_RPC),
     maxGasGwei: parseInt(getEnv('MAX_GAS_GWEI', String(DEFAULT_MAX_GAS_GWEI)), 10),
-    budgetEth: BigInt(getEnv('BUDGET_ETH', DEFAULT_BUDGET_ETH)),
+    budgetEth: parseEthToWei(budgetStr),
     minerBackend: (getEnv('MINER_BACKEND', 'auto') as BackendType),
     minerName: getEnv('MINER_NAME', 'unnamed-miner'),
     reportEnabled: getEnv('REPORT', 'on') === 'on',
